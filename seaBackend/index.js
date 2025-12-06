@@ -1,137 +1,91 @@
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
-const { createClient } = require('@supabase/supabase-js');
-const multer = require('multer');
+import express from "express";
+import multer from "multer";
+import fetch from "node-fetch";
+import FormData from "form-data";
+import cors from "cors";
 
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: "*" }
-});
-
-// Supabase
-const supabaseUrl = 'https://kirsnvselaqtdaloxfuu.supabase.co';
-const supabaseAnonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtpcnNudnNlbGFxdGRhbG94ZnV1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTUxOTAxMDcsImV4cCI6MjA3MDc2NjEwN30.PrsXn_KkEZbNUXNYpKdvmR8ljUQLzvxy6EXYpKBdd5A';
-const supabase = createClient(supabaseUrl, supabaseAnonKey);
-
-// Multer for file uploads
-const storage = multer.memoryStorage();
-const upload = multer({ storage });
-
-// Middleware
+app.use(cors());
 app.use(express.json());
 
-// Photo upload endpoint
-app.post('/upload-photo', upload.single('photo'), async (req, res) => {
+const upload = multer({ storage: multer.memoryStorage() });
+
+// ==========================================
+// IMAGE UPLOAD → ImgHippo
+// ==========================================
+app.post("/upload-image", upload.single("image"), async (req, res) => {
   const file = req.file;
-  if (!file) {
-    return res.status(400).json({ error: 'No file uploaded' });
-  }
-
-  // Check file type
-  if (!file.mimetype.startsWith('image/') && !file.mimetype.startsWith('video/')) {
-    return res.status(400).json({ error: 'Only images and videos allowed' });
-  }
-
-  // Check file size (10MB)
-  if (file.size > 10 * 1024 * 1024) {
-    return res.status(400).json({ error: 'File too large' });
-  }
+  if (!file) return res.status(400).json({ error: "No image uploaded" });
 
   try {
-    const fileName = `photos/${Date.now()}-${Math.random().toString(36).substring(7)}.${file.originalname.split('.').pop()}`;
-    const { data, error } = await supabase.storage
-      .from('avatars')
-      .upload(fileName, file.buffer, {
-        contentType: file.mimetype,
-        upsert: false
-      });
+    const form = new FormData();
+    form.append("api_key", "906db25b5178e738f740b214d6688467");
+    form.append("file", file.buffer, file.originalname);
 
-    if (error) {
-      console.error('Upload error:', error);
-      return res.status(500).json({ error: 'Upload failed' });
+    const response = await fetch("https://api.imghippo.com/v1/upload", {
+      method: "POST",
+      body: form,
+      headers: form.getHeaders(),
+    });
+
+    const data = await response.json();
+    console.log("Image upload result:", data);
+
+    if (!data.success) {
+      return res.status(500).json({ error: "Image upload failed", details: data });
     }
 
-    const { data: { publicUrl } } = supabase.storage
-      .from('avatars')
-      .getPublicUrl(fileName);
-
-    res.json({ url: publicUrl });
+    res.json({ url: data.data.url });
   } catch (err) {
-    console.error('Unexpected error:', err);
-    res.status(500).json({ error: 'Unexpected error' });
+    res.status(500).json({ error: "Server error", details: err.message });
   }
 });
 
-// Connected users
-const connectedUsers = new Map();
 
-io.on('connection', (socket) => {
-  console.log('✅ Connected:', socket.id);
+// ==========================================
+// VIDEO UPLOAD → StreamingVideoProvider
+// ==========================================
+app.post("/upload-video", upload.single("video"), async (req, res) => {
+  const file = req.file;
 
-  // Join room
-  socket.on('joinRoom', (userId) => {
-    if (!userId) return;
-    socket.join(userId);
-    connectedUsers.set(socket.id, { userId });
-    emitOnlineUsers();
-  });
+  if (!file) return res.status(400).json({ error: "No video uploaded" });
+  if (!file.mimetype.startsWith("video/")) {
+    return res.status(400).json({ error: "Only video files allowed" });
+  }
 
-  // Leave room
-  socket.on('leaveRoom', (userId) => {
-    if (!userId) return;
-    socket.leave(userId);
-    connectedUsers.delete(socket.id);
-    emitOnlineUsers();
-  });
+  const API_USER = "apc-zyKszquKnpuM";
+  const API_PASS = "apc-GCEDq8FGuzEG";
 
-  // Send message
-  socket.on('sendMessage', async (messageData, callback) => {
-    const { sender_id, receiver_id, content, reply_to } = messageData || {};
-    if (!sender_id || !receiver_id || !content) {
-      if (callback) callback({ error: 'Missing fields' });
-      return;
+  try {
+    const apiUrl =
+      `https://api.streamingvideoprovider.com/?username=${API_USER}&password=${API_PASS}&action=video.upload`;
+
+    const form = new FormData();
+    form.append("file", file.buffer, file.originalname);
+
+    const response = await fetch(apiUrl, {
+      method: "POST",
+      body: form,
+      headers: form.getHeaders(),
+    });
+
+    const data = await response.json();
+    console.log("SVP upload:", data);
+
+    if (!data.video_id) {
+      return res.status(500).json({ error: "SVP upload failed", raw: data });
     }
 
-    try {
-      const { data, error } = await supabase
-        .from('messages')
-        .insert([{ sender_id, receiver_id, content, reply_to: reply_to || null }])
-        .select('*');
-
-      if (error) {
-        if (callback) callback({ error: 'Failed to send message' });
-        return;
-      }
-
-      const newMessage = data[0];
-      io.to(receiver_id).emit('receiveMessage', newMessage);
-      if (callback) callback({ success: true, message: newMessage });
-
-    } catch (err) {
-      if (callback) callback({ error: 'Unexpected error' });
-    }
-  });
-
-  // Typing event
-  socket.on('typing', ({ to, typing }) => {
-    const fromUserId = connectedUsers.get(socket.id)?.userId;
-    if (fromUserId) {
-      // Emit only to recipient (not to all users)
-      io.to(to).emit('userTyping', { from: fromUserId, typing });
-    }
-  });
-
-  socket.on('disconnect', () => {
-    connectedUsers.delete(socket.id);
-    emitOnlineUsers();
-  });
-
-  function emitOnlineUsers() {
-    const onlineIds = Array.from(connectedUsers.values()).map(u => u.userId);
-    io.emit('onlineUsers', onlineIds);
+    res.json({ url: `https://play.streamingvideoprovider.com/${data.video_id}` });
+  } catch (err) {
+    res.status(500).json({ error: "SVP error", details: err.message });
   }
 });
 
-server.listen(25588, () => console.log('🚀 Server running on port 25588'));
+
+// ==========================================
+// Start Server
+// ==========================================
+app.listen(25588, () =>
+  console.log("🔥 Server running at http://localhost:25588")
+);
