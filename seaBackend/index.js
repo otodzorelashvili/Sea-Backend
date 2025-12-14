@@ -15,6 +15,25 @@ const supabaseUrl = 'https://kirsnvselaqtdaloxfuu.supabase.co';
 const supabaseAnonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtpcnNudnNlbGFxdGRhbG94ZnV1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTUxOTAxMDcsImV4cCI6MjA3MDc2NjEwN30.PrsXn_KkEZbNUXNYpKdvmR8ljUQLzvxy6EXYpKBdd5A';
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
+// Auth middleware for Socket.IO
+io.use(async (socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (!token) {
+    return next(new Error('Authentication error: No token provided'));
+  }
+
+  try {
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user) {
+      return next(new Error('Authentication error: Invalid token'));
+    }
+    socket.user = user; // Attach user to socket
+    next();
+  } catch (err) {
+    next(new Error('Authentication error'));
+  }
+});
+
 // Multer for file uploads
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
