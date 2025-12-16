@@ -2,155 +2,381 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const { createClient } = require('@supabase/supabase-js');
-const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: "*" }
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
 });
 
-// Supabase
+// Supabase client
 const supabaseUrl = 'https://kirsnvselaqtdaloxfuu.supabase.co';
 const supabaseAnonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtpcnNudnNlbGFxdGRhbG94ZnV1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTUxOTAxMDcsImV4cCI6MjA3MDc2NjEwN30.PrsXn_KkEZbNUXNYpKdvmR8ljUQLzvxy6EXYpKBdd5A';
-const supabase = createClient(supabaseUrl, supabaseAnonKey);
-
-// Auth middleware for Socket.IO (disabled for local testing)
-// io.use(async (socket, next) => {
-//   const token = socket.handshake.auth?.token;
-//   if (!token) {
-//     return next(new Error('Authentication error: No token provided'));
-//   }
-
-//   try {
-//     const { data: { user }, error } = await supabase.auth.getUser(token);
-//     if (error || !user) {
-//       return next(new Error('Authentication error: Invalid token'));
-//     }
-//     socket.user = user; // Attach user to socket
-//     next();
-//   } catch (err) {
-//     next(new Error('Authentication error'));
-//   }
-// });
-
-// Multer for file uploads
-const storage = multer.memoryStorage();
-const upload = multer({ storage });
-
-// Middleware
-app.use(express.json());
-
-// Photo upload endpoint
-app.post('/upload-photo', upload.single('photo'), async (req, res) => {
-  const file = req.file;
-  if (!file) {
-    return res.status(400).json({ error: 'No file uploaded' });
-  }
-
-  // Check file type
-  if (!file.mimetype.startsWith('image/') && !file.mimetype.startsWith('video/')) {
-    return res.status(400).json({ error: 'Only images and videos allowed' });
-  }
-
-  // Check file size (10MB)
-  if (file.size > 10 * 1024 * 1024) {
-    return res.status(400).json({ error: 'File too large' });
-  }
-
-  try {
-    const fileName = `photos/${Date.now()}-${Math.random().toString(36).substring(7)}.${file.originalname.split('.').pop()}`;
-    const { data, error } = await supabase.storage
-      .from('avatars')
-      .upload(fileName, file.buffer, {
-        contentType: file.mimetype,
-        upsert: false
-      });
-
-    if (error) {
-      console.error('Upload error:', error);
-      return res.status(500).json({ error: 'Upload failed' });
-    }
-
-    const { data: { publicUrl } } = supabase.storage
-      .from('avatars')
-      .getPublicUrl(fileName);
-
-    res.json({ url: publicUrl });
-  } catch (err) {
-    console.error('Unexpected error:', err);
-    res.status(500).json({ error: 'Unexpected error' });
-  }
+const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+  global: {
+    headers: {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+    },
+  },
+  db: { 
+    schema: 'public',
+  },
+  auth:  {
+    persistSession: true,
+    autoRefreshToken: true,
+  },
 });
 
-// Connected users
+// Track connected users
 const connectedUsers = new Map();
 
-io.on('connection', (socket) => {
-  console.log('✅ Connected:', socket.id);
+// Enhanced logging function
+function logEvent(event, socketId, details = {}) {
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] [${event}] Socket: ${socketId}`, details);
+}
 
-  // Join room
+// Socket.io connection
+io.on('connection', (socket) => {
+  logEvent('CONNECTION', socket.id);
+
+  // Authenticate socket with Supabase token
+  const token = socket.handshake.auth?.token;
+  if (!token) {
+    logEvent('AUTH_ERROR', socket.id, { error: 'No token provided' });
+    socket.emit('error', 'Authentication required');
+    socket.disconnect();
+    return;
+  }
+
+  // Create authenticated Supabase client for this socket
+  const authenticatedSupabase = createClient(supabaseUrl, supabaseAnonKey, {
+    global: {
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+    },
+    db: {
+      schema: 'public',
+    },
+    auth: {
+      persistSession: true,
+      autoRefreshToken: true,
+    },
+  });
+
+  // Store authenticated client on socket
+  socket.supabase = authenticatedSupabase;
+
+  connectedUsers.set(socket.id, { connectedAt: new Date() });
+
+  // Join room with user ID
   socket.on('joinRoom', (userId) => {
-    if (!userId) return;
+    if (!userId) {
+      logEvent('ERROR', socket.id, { error: 'Missing userId in joinRoom' });
+      return;
+    }
+    
     socket.join(userId);
-    connectedUsers.set(socket.id, { userId });
-    emitOnlineUsers();
+    connectedUsers.set(socket.id, { 
+      ...connectedUsers.get(socket.id), 
+      userId, 
+      room: userId 
+    });
+    logEvent('JOIN_ROOM', socket.id, { userId });
   });
 
   // Leave room
   socket.on('leaveRoom', (userId) => {
-    if (!userId) return;
-    socket.leave(userId);
-    connectedUsers.delete(socket.id);
-    emitOnlineUsers();
-  });
-
-  // Send message
-  socket.on('sendMessage', async (messageData, callback) => {
-    const { sender_id, receiver_id, content, reply_to } = messageData || {};
-    if (!sender_id || !receiver_id || !content) {
-      if (callback) callback({ error: 'Missing fields' });
+    if (!userId) {
+      logEvent('ERROR', socket.id, { error: 'Missing userId in leaveRoom' });
       return;
     }
+    
+    socket.leave(userId);
+    const userData = connectedUsers.get(socket.id);
+    if (userData) {
+      connectedUsers.set(socket.id, { ...userData, room: null });
+    }
+    logEvent('LEAVE_ROOM', socket.id, { userId });
+  });
 
+  // Listen for new messages - Real-time message sending function
+  socket.on('sendMessage', async (messageData, callback) => {
     try {
-      const { data, error } = await supabase
-        .from('messages')
-        .insert([{ sender_id, receiver_id, content, reply_to: reply_to || null }])
-        .select('*');
+      logEvent('SEND_MESSAGE_ATTEMPT', socket.id, messageData);
 
-      if (error) {
-        if (callback) callback({ error: 'Failed to send message' });
+      // Validate message data
+      const { sender_id, receiver_id, content, reply_to, is_mention } = messageData;
+
+      if (!sender_id || !receiver_id || !content) {
+        logEvent('ERROR', socket.id, {
+          error: 'Missing required message fields',
+          data: messageData
+        });
+        callback({ error: 'Missing required fields: sender_id, receiver_id, or content' });
         return;
       }
 
-      const newMessage = data[0];
-      io.to(receiver_id).emit('receiveMessage', newMessage);
-      if (callback) callback({ success: true, message: newMessage });
+      if (content.length > 1000) {
+        logEvent('ERROR', socket.id, {
+          error: 'Message too long',
+          length: content.length
+        });
+        callback({ error: 'Message exceeds maximum length of 1000 characters' });
+        return;
+      }
 
-    } catch (err) {
-      if (callback) callback({ error: 'Unexpected error' });
+      // First, insert the message into Supabase database
+      const { data, error } = await socket.supabase
+        .from('messages')
+        .insert([{
+          sender_id,
+          receiver_id,
+          content
+        }])
+        .select('*')
+        .single();
+
+      if (error) {
+        logEvent('SUPABASE_ERROR', socket.id, {
+          error: error.message,
+          code: error.code
+        });
+        callback({ error: 'Failed to save message to database' });
+        return;
+      }
+
+      const savedMessage = data;
+      logEvent('MESSAGE_SAVED', socket.id, {
+        messageId: savedMessage.id,
+        sender_id,
+        receiver_id
+      });
+
+      // Emit the saved message to the receiver for real-time delivery
+      io.to(receiver_id).emit('receiveMessage', savedMessage);
+
+      // Emit confirmation back to sender (optional, for status update)
+      socket.emit('messageSent', {
+        tempId: messageData.tempId,
+        messageId: savedMessage.id,
+        status: 'sent'
+      });
+
+      logEvent('MESSAGE_DELIVERED', socket.id, {
+        messageId: savedMessage.id,
+        deliveredTo: receiver_id
+      });
+
+      // Acknowledge the sendMessage emit
+      callback({ message: savedMessage });
+
+    } catch (error) {
+      logEvent('UNEXPECTED_ERROR', socket.id, {
+        error: error.message,
+        stack: error.stack
+      });
+      callback({ error: 'An unexpected error occurred. Please try again.' });
     }
   });
 
-  // Typing event
-  socket.on('typing', ({ to, typing }) => {
-    const fromUserId = connectedUsers.get(socket.id)?.userId;
-    if (fromUserId) {
-      // Emit only to recipient (not to all users)
-      io.to(to).emit('userTyping', { from: fromUserId, typing });
-    }
-  });
-
-  socket.on('disconnect', () => {
+  // Handle disconnection
+  socket.on('disconnect', (reason) => {
+    const userData = connectedUsers.get(socket.id);
+    logEvent('DISCONNECT', socket.id, { 
+      reason, 
+      userId: userData?.userId,
+      duration: userData ? (new Date() - userData.connectedAt) / 1000 + 's' : 'unknown'
+    });
     connectedUsers.delete(socket.id);
-    emitOnlineUsers();
   });
 
-  function emitOnlineUsers() {
-    const onlineIds = Array.from(connectedUsers.values()).map(u => u.userId);
-    io.emit('onlineUsers', onlineIds);
+  // Handle connection errors
+  socket.on('error', (error) => {
+    logEvent('SOCKET_ERROR', socket.id, { error: error.message });
+  });
+
+  // Join group room
+  socket.on('joinGroup', (groupId) => {
+    if (!groupId) {
+      logEvent('ERROR', socket.id, { error: 'Missing groupId in joinGroup' });
+      return;
+    }
+
+    socket.join(`group-${groupId}`);
+    connectedUsers.set(socket.id, {
+      ...connectedUsers.get(socket.id),
+      groupId,
+      groupRoom: `group-${groupId}`
+    });
+    logEvent('JOIN_GROUP', socket.id, { groupId });
+  });
+
+  // Leave group room
+  socket.on('leaveGroup', (groupId) => {
+    if (!groupId) {
+      logEvent('ERROR', socket.id, { error: 'Missing groupId in leaveGroup' });
+      return;
+    }
+
+    socket.leave(`group-${groupId}`);
+    const userData = connectedUsers.get(socket.id);
+    if (userData) {
+      connectedUsers.set(socket.id, { ...userData, groupId: null, groupRoom: null });
+    }
+    logEvent('LEAVE_GROUP', socket.id, { groupId });
+  });
+
+  // Listen for group messages - Real-time group message sending
+  socket.on('sendGroupMessage', async (messageData, callback) => {
+    try {
+      logEvent('SEND_GROUP_MESSAGE_ATTEMPT', socket.id, messageData);
+
+      // Validate message data
+      const { sender_id, group_id, content, reply_to } = messageData;
+
+      if (!sender_id || !group_id || !content) {
+        logEvent('ERROR', socket.id, {
+          error: 'Missing required group message fields',
+          data: messageData
+        });
+        callback({ error: 'Missing required fields: sender_id, group_id, or content' });
+        return;
+      }
+
+      if (content.length > 1000) {
+        logEvent('ERROR', socket.id, {
+          error: 'Group message too long',
+          length: content.length
+        });
+        callback({ error: 'Message exceeds maximum length of 1000 characters' });
+        return;
+      }
+
+      // First, insert the message into Supabase database
+      const { data, error } = await socket.supabase
+        .from('group_messages')
+        .insert([{
+          sender_id,
+          group_id,
+          content,
+          reply_to: reply_to || null
+        }])
+        .select('*')
+        .single();
+
+      if (error) {
+        logEvent('SUPABASE_ERROR', socket.id, {
+          error: error.message,
+          code: error.code
+        });
+        callback({ error: 'Failed to save group message to database' });
+        return;
+      }
+
+      const savedMessage = data;
+      logEvent('GROUP_MESSAGE_SAVED', socket.id, {
+        messageId: savedMessage.id,
+        sender_id,
+        group_id
+      });
+
+      // Emit the saved message to all group members for real-time delivery
+      io.to(`group-${group_id}`).emit('receiveGroupMessage', savedMessage);
+
+      // Emit confirmation back to sender (optional, for status update)
+      socket.emit('groupMessageSent', {
+        tempId: messageData.tempId,
+        messageId: savedMessage.id,
+        status: 'sent'
+      });
+
+      logEvent('GROUP_MESSAGE_DELIVERED', socket.id, {
+        messageId: savedMessage.id,
+        deliveredTo: `group-${group_id}`
+      });
+
+      // Acknowledge the sendGroupMessage emit
+      callback({ message: savedMessage });
+
+    } catch (error) {
+      logEvent('UNEXPECTED_ERROR', socket.id, {
+        error: error.message,
+        stack: error.stack
+      });
+      callback({ error: 'An unexpected error occurred. Please try again.' });
+    }
+  });
+});
+
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    connectedUsers: connectedUsers.size,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Create uploads directory if it doesn't exist
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
+// Photo upload endpoint
+app.post('/upload', express.raw({ type: 'application/octet-stream', limit: '10mb' }), async (req, res) => {
+  try {
+    const fileName = `photo_${Date.now()}_${Math.random().toString(36).substring(7)}.jpg`;
+    const filePath = path.join(uploadsDir, fileName);
+
+    // Write file to disk
+    fs.writeFileSync(filePath, req.body);
+
+    // Return the URL
+    const baseUrl = process.env.BASE_URL || `http://localhost:${PORT}`;
+    const photoUrl = `${baseUrl}/uploads/${fileName}`;
+
+    res.json({
+      success: true,
+      url: photoUrl,
+      fileName: fileName
+    });
+
+  } catch (error) {
+    console.error('Upload error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to upload photo'
+    });
   }
 });
 
-server.listen(25588, () => console.log('🚀 Server running on port 25588'));
+// Serve uploaded files
+app.use('/uploads', express.static(uploadsDir));
+
+// Start the server
+const PORT = process.env.PORT || 25607;
+server.listen(PORT, () => {
+  console.log(`🚀 Socket.io server is running on port ${PORT}`);
+  console.log(`📊 Health check available at http://localhost:${PORT}/health`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  logEvent('SHUTDOWN', 'system', { reason: 'SIGTERM' });
+  server.close(() => {
+    console.log('Server closed gracefully');
+    process.exit(0);
+  });
+});
