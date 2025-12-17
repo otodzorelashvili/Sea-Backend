@@ -81,19 +81,14 @@ io.on('connection', (socket) => {
     
     console.log(`👤 User ${userId} joined room (socket: ${socket.id})`);
     
-    // Join the user's personal room
     socket.join(userId);
-    
-    // Track this connection
     connectedUsers.set(socket.id, { userId });
     
-    // Track all socket IDs for this user
     if (!userRooms.has(userId)) {
       userRooms.set(userId, new Set());
     }
     userRooms.get(userId).add(socket.id);
     
-    // Emit updated online users list
     emitOnlineUsers();
   });
 
@@ -106,7 +101,6 @@ io.on('connection', (socket) => {
     socket.leave(userId);
     connectedUsers.delete(socket.id);
     
-    // Remove this socket from user's rooms
     if (userRooms.has(userId)) {
       userRooms.get(userId).delete(socket.id);
       if (userRooms.get(userId).size === 0) {
@@ -117,7 +111,7 @@ io.on('connection', (socket) => {
     emitOnlineUsers();
   });
 
-  // Send message - FIXED VERSION with RealTime sync
+  // Send message - FIXED VERSION
   socket.on('sendMessage', async (messageData, callback) => {
     const { sender_id, receiver_id, content, reply_to, is_mention } = messageData || {};
     
@@ -128,7 +122,6 @@ io.on('connection', (socket) => {
     }
 
     try {
-      // Insert message into database
       const { data, error } = await supabase
         .from('messages')
         .insert([{ 
@@ -152,18 +145,14 @@ io.on('connection', (socket) => {
       const newMessage = data;
       console.log('✅ Message saved to DB:', newMessage.id);
 
-      // Send to BOTH sender and receiver immediately via Socket.IO
-      // This ensures instant delivery without waiting for Supabase RealTime
-      
       // Send to receiver
       io.to(receiver_id).emit('receiveMessage', newMessage);
       console.log(`📤 Message sent to receiver ${receiver_id}`);
       
-      // IMPORTANT: Also send back to sender so their UI updates
+      // Send to sender
       io.to(sender_id).emit('receiveMessage', newMessage);
       console.log(`📤 Message sent to sender ${sender_id}`);
 
-      // Send success callback with the actual message data
       if (callback) {
         callback({ 
           success: true, 
@@ -190,7 +179,8 @@ io.on('connection', (socket) => {
       const { data, error } = await supabase
         .from('group_messages')
         .insert([{ sender_id, group_id, content, reply_to: reply_to || null }])
-        .select('*');
+        .select('*')
+        .single();
 
       if (error) {
         console.error('Database insert error:', error);
@@ -198,9 +188,8 @@ io.on('connection', (socket) => {
         return;
       }
 
-      const newMessage = data[0];
+      const newMessage = data;
       
-      // Broadcast to all members of the group
       io.to(group_id).emit('receiveGroupMessage', newMessage);
       
       if (callback) callback({ success: true, message: newMessage });
@@ -211,11 +200,10 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Typing event - Fixed to only emit to specific user
+  // Typing event
   socket.on('typing', ({ to, typing }) => {
     const fromUserId = connectedUsers.get(socket.id)?.userId;
     if (fromUserId && to) {
-      // Emit ONLY to the recipient, not broadcast
       io.to(to).emit('userTyping', { from: fromUserId, typing });
     }
   });
@@ -225,7 +213,6 @@ io.on('connection', (socket) => {
     if (!Array.isArray(messageIds) || messageIds.length === 0) return;
 
     try {
-      // Update message status in database
       const { error } = await supabase
         .from('messages')
         .update({ status: 'seen' })
@@ -236,7 +223,6 @@ io.on('connection', (socket) => {
         return;
       }
 
-      // Notify sender that messages were seen
       const { data: messages } = await supabase
         .from('messages')
         .select('sender_id')
@@ -291,10 +277,8 @@ io.on('connection', (socket) => {
     if (userData) {
       const userId = userData.userId;
       
-      // Remove from tracking
       connectedUsers.delete(socket.id);
       
-      // Remove socket from user's rooms
       if (userRooms.has(userId)) {
         userRooms.get(userId).delete(socket.id);
         if (userRooms.get(userId).size === 0) {
@@ -306,9 +290,7 @@ io.on('connection', (socket) => {
     emitOnlineUsers();
   });
 
-  // Emit online users list
   function emitOnlineUsers() {
-    // Get unique user IDs from userRooms
     const onlineUserIds = Array.from(userRooms.keys());
     console.log('📊 Online users:', onlineUserIds.length);
     io.emit('onlineUsers', onlineUserIds);
