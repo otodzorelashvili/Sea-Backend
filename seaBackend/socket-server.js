@@ -78,78 +78,150 @@ io.on('connection', (socket) => {
     logEvent('LEAVE_ROOM', socket.id, { userId });
   });
 
-  // Listen for new messages
-  socket.on('sendMessage', async (messageData) => {
+  // Listen for new messages - Real-time message sending function
+  socket.on('sendMessage', async (messageData, callback) => {
     try {
       logEvent('SEND_MESSAGE_ATTEMPT', socket.id, messageData);
-      
+
+      // Get user token from handshake auth
+      const token = socket.handshake.auth?.token;
+      if (!token) {
+        logEvent('AUTH_ERROR', socket.id, { error: 'No authentication token provided' });
+        callback({ error: 'Authentication required' });
+        return;
+      }
+
       // Validate message data
-      const { sender_id, receiver_id, content, reply_to } = messageData;
-      
+      const { sender_id, receiver_id, content, reply_to, is_mention } = messageData;
+
       if (!sender_id || !receiver_id || !content) {
-        logEvent('ERROR', socket.id, { 
-          error: 'Missing required message fields', 
-          data: messageData 
+        logEvent('ERROR', socket.id, {
+          error: 'Missing required message fields',
+          data: messageData
         });
-        socket.emit('messageError', { 
-          error: 'Missing required fields: sender_id, receiver_id, or content' 
-        });
+        callback({ error: 'Missing required fields: sender_id, receiver_id, or content' });
         return;
       }
 
       if (content.length > 1000) {
-        logEvent('ERROR', socket.id, { 
-          error: 'Message too long', 
-          length: content.length 
+        logEvent('ERROR', socket.id, {
+          error: 'Message too long',
+          length: content.length
         });
-        socket.emit('messageError', { 
-          error: 'Message exceeds maximum length of 1000 characters' 
-        });
+        callback({ error: 'Message exceeds maximum length of 1000 characters' });
         return;
       }
 
-      // Insert message into Supabase
-      const { data, error } = await supabase
-        .from('messages')
-        .insert([{ 
-          sender_id, 
-          receiver_id, 
-          content,
-          reply_to: reply_to || null
-        }])
-        .select('*');
+      // Create authenticated Supabase client for the user
+      const userSupabase = createClient(supabaseUrl, supabaseAnonKey, {
+        global: {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+          },
+        },
+        db: {
+          schema: 'public',
+        },
+        auth: {
+          persistSession: false,
+          autoRefreshToken: false,
+        },
+      });
+
+      // Validate token by checking user authentication
+      const { data: userData, error: authError } = await userSupabase.auth.getUser();
+      if (authError || !userData.user) {
+        logEvent('AUTH_ERROR', socket.id, {
+          error: 'Invalid or expired token',
+          authError: authError?.message
+        });
+        callback({ error: 'Authentication failed. Please log in again.' });
+        return;
+      }
+
+      // Verify sender_id matches authenticated user
+      if (userData.user.id !== sender_id) {
+        logEvent('AUTH_ERROR', socket.id, {
+          error: 'Sender ID mismatch',
+          authenticatedUser: userData.user.id,
+          providedSenderId: sender_id
+        });
+        callback({ error: 'Authentication mismatch. Please log in again.' });
+        return;
+      }
+
+      // First, insert the message into Supabase database
+      let data, error;
+      try {
+        const result = await userSupabase
+          .from('messages')
+          .insert([{
+            sender_id,
+            receiver_id,
+            content,
+            reply_to: reply_to || null,
+            is_mention: is_mention || false
+          }])
+          .select('*')
+          .single();
+
+        data = result.data;
+        error = result.error;
+      } catch (dbError) {
+        logEvent('SUPABASE_ERROR', socket.id, {
+          error: dbError.message,
+          code: dbError.code,
+          details: dbError.details,
+          hint: dbError.hint
+        });
+        callback({ error: `Database error: ${dbError.message}` });
+        return;
+      }
 
       if (error) {
-        logEvent('SUPABASE_ERROR', socket.id, { 
-          error: error.message, 
-          code: error.code 
+        logEvent('SUPABASE_ERROR', socket.id, {
+          error: error.message,
+          code: error.code,
+          details: error.details,
+          hint: error.hint
         });
-        socket.emit('messageError', { 
-          error: 'Failed to send message. Please try again.' 
-        });
+        callback({ error: `Failed to save message to database: ${error.message}` });
         return;
       }
 
-      const newMessage = data[0];
-      
-      // Emit the new message to both sender and receiver
-      logEvent('MESSAGE_SENT', socket.id, { 
-        messageId: newMessage.id, 
-        sender_id, 
-        receiver_id 
+      const savedMessage = data;
+      logEvent('MESSAGE_SAVED', socket.id, {
+        messageId: savedMessage.id,
+        sender_id,
+        receiver_id
       });
-      
-      io.to(sender_id).emit('receiveMessage', newMessage);
-      io.to(receiver_id).emit('receiveMessage', newMessage);
-      
+
+      // Emit the saved message to the receiver for real-time delivery
+      io.to(receiver_id).emit('receiveMessage', savedMessage);
+
+      // Emit confirmation back to sender (optional, for status update)
+      socket.emit('messageSent', {
+        tempId: messageData.tempId,
+        messageId: savedMessage.id,
+        status: 'sent'
+      });
+
+      logEvent('MESSAGE_DELIVERED', socket.id, {
+        messageId: savedMessage.id,
+        deliveredTo: receiver_id
+      });
+
+      // Acknowledge the sendMessage emit
+      callback({ message: savedMessage });
+
     } catch (error) {
-      logEvent('UNEXPECTED_ERROR', socket.id, { 
-        error: error.message, 
-        stack: error.stack 
+      logEvent('UNEXPECTED_ERROR', socket.id, {
+        error: error.message,
+        stack: error.stack
       });
-      socket.emit('messageError', { 
-        error: 'An unexpected error occurred. Please try again.' 
-      });
+      callback({ error: 'An unexpected error occurred. Please try again.' });
     }
   });
 
@@ -168,7 +240,168 @@ io.on('connection', (socket) => {
   socket.on('error', (error) => {
     logEvent('SOCKET_ERROR', socket.id, { error: error.message });
   });
+
+  // Join group room
+  socket.on('joinGroup', (groupId) => {
+    if (!groupId) {
+      logEvent('ERROR', socket.id, { error: 'Missing groupId in joinGroup' });
+      return;
+    }
+
+    socket.join(`group-${groupId}`);
+    connectedUsers.set(socket.id, {
+      ...connectedUsers.get(socket.id),
+      groupId,
+      groupRoom: `group-${groupId}`
+    });
+    logEvent('JOIN_GROUP', socket.id, { groupId });
+  });
+
+  // Leave group room
+  socket.on('leaveGroup', (groupId) => {
+    if (!groupId) {
+      logEvent('ERROR', socket.id, { error: 'Missing groupId in leaveGroup' });
+      return;
+    }
+
+    socket.leave(`group-${groupId}`);
+    const userData = connectedUsers.get(socket.id);
+    if (userData) {
+      connectedUsers.set(socket.id, { ...userData, groupId: null, groupRoom: null });
+    }
+    logEvent('LEAVE_GROUP', socket.id, { groupId });
+  });
+
+  // Listen for group messages - Real-time group message sending
+  socket.on('sendGroupMessage', async (messageData, callback) => {
+    try {
+      logEvent('SEND_GROUP_MESSAGE_ATTEMPT', socket.id, messageData);
+
+      // Get user token from handshake auth
+      const token = socket.handshake.auth?.token;
+      if (!token) {
+        logEvent('AUTH_ERROR', socket.id, { error: 'No authentication token provided' });
+        callback({ error: 'Authentication required' });
+        return;
+      }
+
+      // Validate message data
+      const { sender_id, group_id, content, reply_to } = messageData;
+
+      if (!sender_id || !group_id || !content) {
+        logEvent('ERROR', socket.id, {
+          error: 'Missing required group message fields',
+          data: messageData
+        });
+        callback({ error: 'Missing required fields: sender_id, group_id, or content' });
+        return;
+      }
+
+      if (content.length > 1000) {
+        logEvent('ERROR', socket.id, {
+          error: 'Group message too long',
+          length: content.length
+        });
+        callback({ error: 'Message exceeds maximum length of 1000 characters' });
+        return;
+      }
+
+      // Create authenticated Supabase client for the user
+      const userSupabase = createClient(supabaseUrl, supabaseAnonKey, {
+        global: {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+          },
+        },
+        db: {
+          schema: 'public',
+        },
+        auth: {
+          persistSession: false,
+          autoRefreshToken: false,
+        },
+      });
+
+      // Validate token by checking user authentication
+      const { data: userData, error: authError } = await userSupabase.auth.getUser();
+      if (authError || !userData.user) {
+        logEvent('AUTH_ERROR', socket.id, {
+          error: 'Invalid or expired token',
+          authError: authError?.message
+        });
+        callback({ error: 'Authentication failed. Please log in again.' });
+        return;
+      }
+
+      // Verify sender_id matches authenticated user
+      if (userData.user.id !== sender_id) {
+        logEvent('AUTH_ERROR', socket.id, {
+          error: 'Sender ID mismatch',
+          authenticatedUser: userData.user.id,
+          providedSenderId: sender_id
+        });
+        callback({ error: 'Authentication mismatch. Please log in again.' });
+        return;
+      }
+
+      // First, insert the message into Supabase database
+      const { data, error } = await userSupabase
+        .from('group_messages')
+        .insert([{
+          sender_id,
+          group_id,
+          content,
+          reply_to: reply_to || null
+        }])
+        .select('*')
+        .single();
+
+      if (error) {
+        logEvent('SUPABASE_ERROR', socket.id, {
+          error: error.message,
+          code: error.code
+        });
+        callback({ error: 'Failed to save group message to database' });
+        return;
+      }
+
+      const savedMessage = data;
+      logEvent('GROUP_MESSAGE_SAVED', socket.id, {
+        messageId: savedMessage.id,
+        sender_id,
+        group_id
+      });
+
+      // Emit the saved message to all group members for real-time delivery
+      io.to(`group-${group_id}`).emit('receiveGroupMessage', savedMessage);
+
+      // Emit confirmation back to sender (optional, for status update)
+      socket.emit('groupMessageSent', {
+        tempId: messageData.tempId,
+        messageId: savedMessage.id,
+        status: 'sent'
+      });
+
+      logEvent('GROUP_MESSAGE_DELIVERED', socket.id, {
+        messageId: savedMessage.id,
+        deliveredTo: `group-${group_id}`
+      });
+
+      // Acknowledge the sendGroupMessage emit
+      callback({ message: savedMessage });
+
+    } catch (error) {
+      logEvent('UNEXPECTED_ERROR', socket.id, {
+        error: error.message,
+        stack: error.stack
+      });
+      callback({ error: 'An unexpected error occurred. Please try again.' });
+    }
+  });
 });
+
 
 // Health check endpoint
 app.get('/health', (req, res) => {
